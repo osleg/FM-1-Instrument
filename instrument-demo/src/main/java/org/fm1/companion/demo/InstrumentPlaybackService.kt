@@ -31,18 +31,23 @@ import android.os.SystemClock
 import android.provider.OpenableColumns
 import org.fm1.companion.protocol.NativeUi
 import org.fm1.companion.protocol.OpenMidiConnection
+import org.fm1.companion.protocol.UsbMidiPackets
 import org.fm1.companion.protocol.Wire6
 import java.util.Locale
 import java.util.UUID
+import java.io.ByteArrayOutputStream
+import java.security.MessageDigest
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Main-thread owner of the reference instrument, including its screen-off MIDI/audio lease. */
 class InstrumentPlaybackService : Service() {
     data class State(val status: String, val active: Boolean, val synchronized: Boolean,
                      val destination: AudioDestination?, val midiId: Int, val audioId: Int,
                      val midiName: String, val audioName: String,
-                     val externalInputId: Int, val externalOutputId: Int)
+                     val externalInputId: Int, val externalOutputId: Int,
+                     val emulator: Boolean = false, val firmwareName: String = "")
     data class SampleState(val session: String?, val status: String, val recording: Boolean,
                            val busy: Boolean, val ready: Long?)
     private data class StagedSample(val id: Long, val encoded: ByteArray)
@@ -50,6 +55,11 @@ class InstrumentPlaybackService : Service() {
     inner class LocalBinder : Binder() { val service: InstrumentPlaybackService get() = this@InstrumentPlaybackService }
     private val binder = LocalBinder()
     @Volatile private var runtime: SkiffRuntime? = null
+    @Volatile private var emulatorRuntime: EmulatorRuntime? = null
+    @Volatile private var emulatorSurface: EmulatorSurface? = null
+    private var emulatorSaver: ExecutorService? = null
+    private var emulatorCheckpointQueued = AtomicBoolean(false)
+    private var nextEmulatorCheckpoint = 0L
     private val main = Handler(Looper.getMainLooper())
     private lateinit var midi: OpenMidiConnection
     private lateinit var audioManager: AudioManager
@@ -103,25 +113,45 @@ class InstrumentPlaybackService : Service() {
         val usbFilter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(usbDetach, usbFilter, RECEIVER_NOT_EXPORTED)
         else registerReceiver(usbDetach, usbFilter)
-        midi = OpenMidiConnection(this, object : OpenMidiConnection.Surface {
+        midi = OpenMidiConnection(this, object : OpenMidiConnection.RemoteSurface {
             override fun snapshot(): ByteArray {
+                if (state.emulator) return byteArrayOf()
                 val view = requireNotNull(runtime).surface.snapshot()
                 val title = titleOf(view)
                 if (screenTitle != title) { screenTitle = title; notifyObservers() }
                 return view
             }
             override fun input(serial: Int, scan: ByteArray): Boolean =
-                requireNotNull(runtime).surface.input(serial, scan)
-            override fun reset() { runtime?.surface?.reset() }
+                if (state.emulator) requireNotNull(emulatorSurface).input(serial, scan)
+                else requireNotNull(runtime).surface.input(serial, scan)
+            override fun reset() {
+                if (state.emulator) emulatorSurface?.reset() else runtime?.surface?.reset()
+            }
+            override fun frame(): ShortArray? = emulatorSurface?.frame()
+            override fun leds(): ByteArray = emulatorSurface?.leds() ?: ByteArray(29)
         }, object : OpenMidiConnection.Listener {
             override fun beforeTick(now: Long): Boolean {
-                if (measurement == null) runtime?.checkpoint()
+                if (state.emulator && now >= nextEmulatorCheckpoint) {
+                    nextEmulatorCheckpoint = now + 1000L
+                    val running = emulatorRuntime
+                    val saver = emulatorSaver
+                    val queued = emulatorCheckpointQueued
+                    if (running != null && saver != null && queued.compareAndSet(false, true)) {
+                        saver.execute {
+                            try { running.checkpoint() }
+                            finally { queued.set(false) }
+                        }
+                    }
+                }
+                else if (measurement == null) runtime?.checkpoint()
                 else tickMeasurement(now)
                 // The connection checks its MIDI endpoint before this callback.
                 return output?.routeMatches() == true && externalDevicesPresent()
             }
             override fun midiPacket(packet: Int, timestamp: Long) {
-                if (!finishing && state.active && runtime?.midiIn(packet, 2) == false)
+                if (finishing || !state.active) return
+                if (state.emulator) emulatorRuntime?.midi(UsbMidiPackets.bytes(packet))
+                else if (runtime?.midiIn(packet, 2) == false)
                     main.post { if (!finishing && state.active) finish("FM-1 TRS MIDI input overflow") }
             }
             override fun diagnostics(op: Int, values: IntArray) {
@@ -181,6 +211,8 @@ class InstrumentPlaybackService : Service() {
                 val destination = AudioDestination.values().getOrNull(intent.getIntExtra(EXTRA_DESTINATION, -1))
                 val midiId = intent.getIntExtra(EXTRA_MIDI_ID, -1)
                 val audioId = intent.getIntExtra(EXTRA_AUDIO_ID, -1)
+                val firmwareUri = intent.getStringExtra(EXTRA_EMULATOR_URI)
+                val firmwareName = intent.getStringExtra(EXTRA_FIRMWARE_NAME).orEmpty()
                 if (destination == null || midiId < 0 || audioId < 0) {
                     finish("Choose FM-1 MIDI and an audio output")
                     return START_NOT_STICKY
@@ -188,7 +220,7 @@ class InstrumentPlaybackService : Service() {
                 connect(destination, midiId, audioId,
                     intent.getIntExtra(EXTRA_EXTERNAL_INPUT_ID, -1),
                     intent.getIntExtra(EXTRA_EXTERNAL_OUTPUT_ID, -1),
-                    intent.getBooleanExtra(EXTRA_DIAGNOSTIC, false))
+                    intent.getBooleanExtra(EXTRA_DIAGNOSTIC, false), firmwareUri, firmwareName)
             }
             ACTION_STOP -> finish("Disconnected")
             else -> { if (!state.active) stopSelf() }
@@ -336,7 +368,17 @@ class InstrumentPlaybackService : Service() {
     }
 
     private fun connect(destination: AudioDestination, midiId: Int, audioId: Int,
-                        externalInputId: Int, externalOutputId: Int, diagnostic: Boolean) {
+                        externalInputId: Int, externalOutputId: Int, diagnostic: Boolean,
+                        firmwareUri: String?, firmwareName: String) {
+        val emulating = firmwareUri != null
+        if (emulating && !android.os.Process.is64Bit()) {
+            finish("Firmware emulation requires 64-bit Android")
+            return
+        }
+        if (emulating && (diagnostic || externalInputId >= 0 || externalOutputId >= 0)) {
+            finish("Firmware emulation cannot start with diagnostics or external MIDI routing")
+            return
+        }
         if (diagnostic && (destination.wireMode != Wire6.USB_RETURN || externalInputId >= 0 || externalOutputId >= 0)) {
             finish("The hardware test needs FM-1 USB audio with external MIDI disabled")
             return
@@ -361,28 +403,66 @@ class InstrumentPlaybackService : Service() {
         val audioName = if (usbDevice != null) "${usbDevice.productName ?: "FM-1"} (direct USB)"
             else selectedAudio?.productName?.toString() ?: "Audio output $audioId"
         update(State("Starting ${destination.title} audio…", true, false, destination,
-            midiId, audioId, midiName, audioName, externalInputId, externalOutputId))
+            midiId, audioId, midiName, audioName, externalInputId, externalOutputId,
+            emulating, firmwareName))
         val token = ++attempt
         finishing = false
         try {
+            if (emulating) showNotification()
             val failure: (String) -> Unit = { reason -> main.post { if (token == attempt) finish(reason) } }
-            val instrument = if (diagnostic) {
+            val instrument: PcmRuntime = if (emulating) {
+                val source = Uri.parse(requireNotNull(firmwareUri))
+                val firmware = requireNotNull(contentResolver.openInputStream(source)) {
+                    "Could not open imported firmware package"
+                }.use { stream ->
+                    val bytes = ByteArrayOutputStream()
+                    val chunk = ByteArray(16 * 1024)
+                    while (true) {
+                        val count = stream.read(chunk)
+                        if (count < 0) break
+                        check(bytes.size() + count <= MAX_FIRMWARE_BYTES) {
+                            "Firmware package exceeds 64 MiB"
+                        }
+                        bytes.write(chunk, 0, count)
+                    }
+                    val image = bytes.toByteArray()
+                    require(image.isNotEmpty()) {
+                        "Firmware package must be between 1 byte and 64 MiB"
+                    }
+                    image
+                }
+                val digest = MessageDigest.getInstance("SHA-256").digest(firmware)
+                    .joinToString("") { "%02x".format(it) }
+                val directory = filesDir.resolve("emulator-flash")
+                check(directory.isDirectory || directory.mkdirs()) { "Could not create emulator storage" }
+                EmulatorRuntime(directory.resolve("$digest.bin"), firmware, failure).also {
+                    emulatorRuntime = it
+                    it.boot()
+                    emulatorSurface = EmulatorSurface(it)
+                    emulatorSaver = Executors.newSingleThreadExecutor { task -> Thread(task, "FM1-emulator-flash") }
+                    emulatorCheckpointQueued = AtomicBoolean(false)
+                    nextEmulatorCheckpoint = 0L
+                }
+            } else if (diagnostic) {
                 measurement = HardwareMeasurement(filesDir, midiName, audioName).also { it.start() }
                 SkiffRuntime(object : NorStore {
                     override fun read(): ByteArray? = null
                     override fun write(image: ByteArray) = Unit
                 }, failure)
             } else SkiffRuntime(filesDir.resolve("skiff-nor.bin"), failure)
-            runtime = instrument
-            instrument.boot()
-            if (diagnostic) instrument.startDiagnosticPattern() else {
-                instrument.setDxText(dxText())
-                sampleSession = UUID.randomUUID().toString()
-                sampleWorker = Executors.newSingleThreadExecutor { task -> Thread(task, "Skiff-samples") }
+            if (!emulating) {
+                val skiff = instrument as SkiffRuntime
+                runtime = skiff
+                skiff.boot()
+                if (diagnostic) skiff.startDiagnosticPattern() else {
+                    skiff.setDxText(dxText())
+                    sampleSession = UUID.randomUUID().toString()
+                    sampleWorker = Executors.newSingleThreadExecutor { task -> Thread(task, "Skiff-samples") }
+                }
+                external = ExternalMidiRoute(this, skiff) { reason ->
+                    main.post { if (token == attempt) finish(reason) }
+                }.also { it.open(externalInputId, externalOutputId, midiId) }
             }
-            external = ExternalMidiRoute(this, requireNotNull(runtime)) { reason ->
-                main.post { if (token == attempt) finish(reason) }
-            }.also { it.open(externalInputId, externalOutputId, midiId) }
             showNotification()
             acquireWakeLock()
             // Direct PCM uses a private USB interface. Android may route notifications or other media independently.
@@ -395,11 +475,15 @@ class InstrumentPlaybackService : Service() {
                     } else {
                         update(status = "Output verified; connecting FM-1…")
                         val namespace = when {
+                            emulating -> "org.fm1.emulator"
                             diagnostic && direct -> "org.fm1.skiff.keytime2"
                             diagnostic -> "org.fm1.skiff.keytime"
                             else -> "org.fm1.skiff"
                         }
-                        midi.connect(selectedMidi, namespace, destination.wireMode,
+                        val capabilities = if (emulating) arrayOf(
+                            Wire6.Capability(Wire6.INSTRUMENT, 1, 0, true),
+                            Wire6.Capability(Wire6.REMOTE_UI, 1, 0, true),
+                            Wire6.Capability(Wire6.REMOTE_COMPACT, 1, 0, false)) else arrayOf(
                             Wire6.Capability(Wire6.INSTRUMENT, 1, 0, true),
                             Wire6.Capability(Wire6.NATIVE_UI, 1, 0, true),
                             Wire6.Capability(Wire6.NATIVE_IDLE_KEEPALIVE, 1, 0, false),
@@ -407,6 +491,7 @@ class InstrumentPlaybackService : Service() {
                             Wire6.Capability(Wire6.NATIVE_PANEL, 1, 0, true),
                             Wire6.Capability(Wire6.PANEL_MIDI, 1, 0, true),
                             Wire6.Capability(Wire6.NATIVE_CHROME, 1, 0, false))
+                        midi.connect(selectedMidi, namespace, destination.wireMode, *capabilities)
                     }
                 }
             }
@@ -495,7 +580,7 @@ class InstrumentPlaybackService : Service() {
             .setAction(ACTION_STOP), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val notification = Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle("FM-1 Instrument")
+            .setContentTitle(if (state.emulator) "FM-1 firmware emulator" else "FM-1 Instrument")
             .setContentText("${state.destination?.title ?: "Audio"}: ${state.audioName} • ${state.status}")
             .setContentIntent(open).addAction(android.R.drawable.ic_media_pause, "Stop", stop)
             .setOngoing(true).build()
@@ -538,9 +623,16 @@ class InstrumentPlaybackService : Service() {
         runCatching { external?.stopInput() }
         val ending = runtime
         runtime = null
+        val endingEmulator = emulatorRuntime
+        emulatorRuntime = null
+        emulatorSurface = null
+        emulatorSaver?.shutdown()
+        emulatorSaver = null
         runCatching { ending?.stop() }.onSuccess { packets ->
             if (packets != null) external?.finishWith(packets)
         }.onFailure { reason = "Storage save failed: ${it.message ?: it.javaClass.simpleName}" }
+        runCatching { endingEmulator?.stop() }
+            .onFailure { reason = "Firmware flash save failed: ${it.message ?: it.javaClass.simpleName}" }
         runCatching { external?.close() }
         external = null
         focusRequest?.let { runCatching { audioManager.abandonAudioFocusRequest(it) } }
@@ -564,6 +656,7 @@ class InstrumentPlaybackService : Service() {
     companion object {
         private const val CHANNEL = "fm1_instrument_playback"
         private const val NOTIFICATION_ID = 1
+        private const val MAX_FIRMWARE_BYTES = 64 * 1024 * 1024
         const val ACTION_CONNECT = "org.fm1.companion.demo.CONNECT"
         const val ACTION_STOP = "org.fm1.companion.demo.STOP"
         const val EXTRA_DIAGNOSTIC = "hardware_measurement"
@@ -572,5 +665,7 @@ class InstrumentPlaybackService : Service() {
         const val EXTRA_DESTINATION = "destination"
         const val EXTRA_EXTERNAL_INPUT_ID = "external_input_id"
         const val EXTRA_EXTERNAL_OUTPUT_ID = "external_output_id"
+        const val EXTRA_EMULATOR_URI = "emulator_uri"
+        const val EXTRA_FIRMWARE_NAME = "firmware_name"
     }
 }

@@ -11,10 +11,11 @@ public final class Wire6 {
     private Wire6() {}
     public static final int HELLO = 1, ACK = 2, STATE = 3, HEARTBEAT = 4,
             BYE = 5, INPUT = 6, PROBE = 7, OFFER = 8, VIEW_PART = 9, VIEW_DELTA = 10,
-            DIAGNOSTICS = 11, PART_READY = 12;
+            DIAGNOSTICS = 11, PART_READY = 12, REMOTE = 13;
     public static final int PHONE = 0, USB_RETURN = 1;
     public static final int INSTRUMENT = 1, TRANSPORT = 2, PARTS = 3, NATIVE_UI = 9,
-            NATIVE_IDLE_KEEPALIVE = 11, NATIVE_DELTA = 12, NATIVE_PANEL = 13, PANEL_MIDI = 14, NATIVE_CHROME = 15;
+            NATIVE_IDLE_KEEPALIVE = 11, NATIVE_DELTA = 12, NATIVE_PANEL = 13, PANEL_MIDI = 14, NATIVE_CHROME = 15,
+            REMOTE_UI = 16, REMOTE_COMPACT = 17;
     public static final int MAX_PAYLOAD = 156, MAX_FRAME = 167;
 
     public static int u14(byte[] b, int at) { return (b[at] & 127) | ((b[at + 1] & 127) << 7); }
@@ -35,7 +36,7 @@ public final class Wire6 {
         }
     }
     public static byte[] frame(int command, int session, int serial, byte[] payload) {
-        if (command < HELLO || command > PART_READY || session <= 0 || session > 16383 ||
+        if (command < HELLO || command > REMOTE || session <= 0 || session > 16383 ||
                 serial < 0 || serial > 16383 || payload == null || payload.length > MAX_PAYLOAD)
             throw new IllegalArgumentException("frame range");
         byte[] b = new byte[11 + payload.length];
@@ -121,10 +122,11 @@ public final class Wire6 {
         return b;
     }
     public static void validate(int command, int serial, byte[] p) {
-        if (p == null || p.length > MAX_PAYLOAD || command < HELLO || command > PART_READY)
+        if (p == null || p.length > MAX_PAYLOAD || command < HELLO || command > REMOTE)
             throw new IllegalArgumentException("command/payload");
         for (byte value : p) if ((value & 128) != 0) throw new IllegalArgumentException("non-seven-bit");
         switch (command) {
+            case REMOTE: RemoteDisplay.validate(p); return;
             case PART_READY:
                 if (p.length != 2 || u14(p, 0) == 0 || u14(p, 0) >= NativeUi.MAX_LENGTH)
                     throw new IllegalArgumentException("part ready");
@@ -155,7 +157,7 @@ public final class Wire6 {
                 return;
             }
             case ACK: {
-                if (p.length < 2 || p[0] < HELLO || p[0] > DIAGNOSTICS || p[1] > 3)
+                if (p.length < 2 || p[0] < HELLO || p[0] > REMOTE || p[0] == PART_READY || p[1] > 3)
                     throw new IllegalArgumentException("ack");
                 if (p[0] == HELLO && p[1] == 0) {
                     if (serial != 0 || p.length < 3) throw new IllegalArgumentException("hello ack");
@@ -208,7 +210,8 @@ public final class Wire6 {
                 throw new IllegalArgumentException("capability record");
             if (!hello && !offer && (p[i + 1] != 1 || p[i + 2] != 0 ||
                     (id != INSTRUMENT && id != TRANSPORT && id != PARTS && id != NATIVE_UI &&
-                            id != NATIVE_IDLE_KEEPALIVE && id != NATIVE_DELTA && id != NATIVE_PANEL && id != PANEL_MIDI && id != NATIVE_CHROME)))
+                            id != NATIVE_IDLE_KEEPALIVE && id != NATIVE_DELTA && id != NATIVE_PANEL && id != PANEL_MIDI &&
+                            id != NATIVE_CHROME && id != REMOTE_UI && id != REMOTE_COMPACT)))
                 throw new IllegalArgumentException("capability version");
         }
     }

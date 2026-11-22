@@ -1,6 +1,6 @@
 # FM-1 companion library
 
-This Android library implements the first layers of the project's Open FM-1 Companion HLD: the existing **legacy CAFA v5** connection used by LOOM, shared parameter and sequence controls, and a **wire-6 instrument API** with negotiation, physical controls and operation results. Generic sequence views, preset/project and complete pocket workflows remain unfinished.
+This Android library supports **legacy CAFA v5** and negotiated **wire 6**. It shares parameter and sequence controls, an instrument API and the Native UI and Remote UI profiles. Generic sequence views, preset/project and complete pocket workflows remain unfinished.
 
 ## Implemented boundary
 
@@ -32,7 +32,7 @@ connection.connect(device, adapter.namespace, Wire6.PHONE,
     Wire6.Capability(Wire6.INSTRUMENT, 1, 0, true))
 ```
 
-The controller exposes instrument capability 1, optional transport capability 2 and optional parts/mixing capability 3. It does not implement preset storage, expression or sequence editing. Callbacks and model access stay on the main thread; the app separately owns audio rendering and route policy. The reference app offers explicit phone/wired or FM-1 USB output and remains instrument-only. Its foreground playback service owns the session across activity and screen changes. Version 0.1 received user-reported hardware-control and phone-audio smoke acceptance; version 0.2 is now installed, with its USB/background features still requiring device acceptance.
+The controller exposes instrument capability 1, optional transport capability 2 and optional parts/mixing capability 3. Preset storage, expression and sequence editing are outside this controller's adapter. Callbacks and model access stay on the main thread. The app owns audio rendering and route policy. FM-1 Instrument uses a foreground playback service to keep the session active across activity and screen changes.
 
 ## Optional transport workflow
 
@@ -60,7 +60,15 @@ The `org.fm1.companion.protocol` package is separate from the legacy codec:
 
 Call `OpenMidiConnection.connect(device, namespace, audioMode, capabilities...)` on the main thread with an explicit `Wire6.PHONE` or `Wire6.USB_RETURN` route and required instrument capability 1.0. `opened()` only reports open ports. `synchronizedDisplay()` follows acknowledgement of a sent state; the application must also verify its chosen audio route before enabling output. Returning false from this connection's `beforeTick()` closes it. `Surface.reset()` and `stopped()` must release application-owned voices and stop playback. The library does not synthesize or route audio.
 
-This is the lower transport boundary: `Surface.snapshot()` supplies a validated generic view, `Surface.input()` receives the 24-byte physical scan, and `Surface.acknowledged(context)` identifies delivered state for feedback retention. `InstrumentController` implements that boundary for instrument adapters. Remaining capability workflows and LOOM's transition to wire 6 are separate work. LOOM continues to use v5 so its existing pages remain available.
+For the generic profile, `Surface.snapshot()` supplies a validated view, `Surface.input()` receives the 24-byte physical scan, and `Surface.acknowledged(context)` identifies delivered state for feedback retention. `InstrumentController` implements that boundary for instrument adapters. LOOM's wire-6 integration uses Native UI and its legacy path retains the v5 layouts.
+
+## Remote UI profile
+
+Implement `OpenMidiConnection.RemoteSurface` to send app-rendered screens and receive raw hardware scans. On the main thread, `frame()` supplies a row-major `ShortArray` of 240 × 240 RGB565 pixels or `null` when no frame is ready. `leds()` supplies the 29-byte LED payload and defaults to all zeroes. `input(serial, scan)` receives the 24-byte panel scan, and `reset()` clears application-owned panel state when the session ends. The profile uses `frame()` in place of `snapshot()`.
+
+Request `Wire6.INSTRUMENT` and `Wire6.REMOTE_UI` as required at version 1.0. Request `Wire6.REMOTE_COMPACT` as optional for packed tile uploads and batched tile placement. The library handles negotiation, changed tiles, acknowledgement and full-screen recovery. `Listener.synchronizedDisplay()` fires after the first complete `PRESENT` is acknowledged. Verify the chosen audio route before starting playback.
+
+Remote UI requires Windjammer v0.9.2 or another build advertising capability 16. Windjammer v0.9.0 supports Native UI. FM-1 Instrument's [firmware emulator](../README.md#remote-ui-demo) demonstrates Remote UI with a guest-rendered screen. See the [Windjammer wire specification](https://github.com/Osleg/Windjammer/blob/main/docs/remote-ui-wire.md).
 
 ## Shared parameter-bank workflow
 

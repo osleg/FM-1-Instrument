@@ -36,5 +36,7 @@ done < "$cpp/vocal-sources.txt"
     -I"$WINDJAMMER_DIR/build/gen" -I"$SKIFF_PROTOCOL_DIR" \
     -o "$tmp/controller-peer" "$WINDJAMMER_DIR/tests/open_link_peer.c" -lm
 java com.sun.tools.javac.Main -d "$tmp" "$protocol/Wire6.java" "$protocol/NativeUi.java" \
-    "$protocol/OpenSession.java" "$here/PairedSessionCheck.java"
+    "$protocol/RemoteDisplay.java" "$protocol/OpenSession.java" "$here/PairedSessionCheck.java" "$here/RemoteSessionCheck.java"
 java -cp "$tmp" PairedSessionCheck "$tmp/paired-host" "$tmp/controller-peer"
+java -cp "$tmp" RemoteSessionCheck "$tmp/controller-peer"
+java -cp "$tmp" RemoteSessionCheck "$tmp/controller-peer" compact

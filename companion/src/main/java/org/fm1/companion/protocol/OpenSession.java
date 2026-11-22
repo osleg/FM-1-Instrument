@@ -16,6 +16,8 @@ public final class OpenSession {
         void send(byte[] frame) throws Exception;
         /** Complete validated legacy or native view. Called when a fresh wire revision is due. */
         byte[] snapshot();
+        default short[] remoteFrame() { return null; }
+        default byte[] remoteLeds() { return new byte[29]; }
         /** Return false if the application cannot safely process this ordered physical scan. */
         boolean input(int serial, byte[] scan);
         /** Release held voices and clear session-bound state. */
@@ -69,6 +71,11 @@ public final class OpenSession {
     private int heartbeatSerial = -1, nextHeartbeatSerial = 8192;
     private long lastHeartbeat, lastSample;
     private boolean owned;
+    private final RemoteDisplay remote = new RemoteDisplay();
+    private byte[] remotePending;
+    private int remoteSerial;
+    private long remoteSent, remoteSample;
+    private int remoteRecoveries;
     private int diagnosticSerial = -1, diagnosticOp, nextDiagnosticSerial = 12000;
     private int queuedDiagnosticOp;
     private long diagnosticSentAt;
@@ -98,6 +105,7 @@ public final class OpenSession {
         host.reset();
         session = id; revision = 0; sentSequence = acknowledgedSequence = 0;
         lastInput = -1; inputs.clear(); pendingStates.clear(); accepted.clear(); offered = null; owned = false;
+        remote.recover(); remotePending = null; remoteSerial = 0; remoteSent = remoteSample = now; remoteRecoveries = 0;
         hello[1] = 0;
         transfer = null; transferOffset = 0; lastNativeView = confirmedNativeView = null;
         recoverFullView = inputSinceSample = ackCredit = fastParts = false;
@@ -116,7 +124,8 @@ public final class OpenSession {
         if (phase == Phase.CLOSED || frame.session != session) return;
         if (phase == Phase.PROBING) {
             if (frame.command != Wire6.OFFER || frame.serial != (offered == null ? 0 : 1)) return;
-            if (frame.serial == 0 && frame.payload[1] >= 2 && requested.containsKey(Wire6.NATIVE_CHROME)) {
+            if (frame.serial == 0 && frame.payload[1] >= 2 &&
+                    (requested.containsKey(Wire6.NATIVE_CHROME) || requested.containsKey(Wire6.REMOTE_UI))) {
                 offered = frame.payload.clone();
                 lastProgress = now;
                 transmit(Wire6.PROBE, 1, new byte[0], now);
@@ -154,6 +163,30 @@ public final class OpenSession {
             host.diagnostics(op, values);
         } else if (frame.command == Wire6.ACK) {
             byte[] p = frame.payload;
+            if (accepted.contains(Wire6.REMOTE_UI) && p[0] == Wire6.REMOTE &&
+                    remotePending != null && frame.serial == remoteSerial) {
+                lastProgress = now;
+                if (p[1] != 0) {
+                    if (++remoteRecoveries > 2) { fail("FM1 rejected remote screen recovery."); return; }
+                    remote.recover(); remotePending = null; remoteSample = now - 100;
+                } else {
+                    boolean present = remotePending[0] == 3;
+                    remotePending = null;
+                    if (present) {
+                        remoteRecoveries = 0;
+                        if (phase == Phase.SYNCHRONIZING) {
+                            phase = Phase.ACTIVE;
+                            host.synchronizedDisplay(audioMode, false);
+                        }
+                    }
+                }
+                if (isOpen()) remoteTick(now);
+                return;
+            }
+            if (accepted.contains(Wire6.REMOTE_UI) && p[0] == Wire6.HEARTBEAT &&
+                    p[1] == 0 && frame.serial == heartbeatSerial) {
+                heartbeatSerial = -1; lastProgress = now; return;
+            }
             if (phase == Phase.HELLO && lastHello != Long.MIN_VALUE && p[0] == Wire6.HELLO && frame.serial == 0) {
                 if (p[1] != 0) { fail("FM1 rejected wire-6 HELLO (" + p[1] + ")."); return; }
                 if (!checkAccepted(p)) { fail("FM1 accepted an invalid capability set."); return; }
@@ -217,7 +250,7 @@ public final class OpenSession {
             }
             if (inputs.size() == 32) { fail("FM1 input queue overflow; reconnect required."); return; }
             inputs.addLast(frame);
-            if (accepted.contains(Wire6.NATIVE_PANEL)) drainInputs();
+            if (accepted.contains(Wire6.NATIVE_PANEL) || accepted.contains(Wire6.REMOTE_UI)) drainInputs();
         } else if (frame.command == Wire6.BYE) fail("FM1 closed the session.");
     }
     private void drainInputs() {
@@ -247,7 +280,7 @@ public final class OpenSession {
     public void tick(long now) {
         if (phase == Phase.CLOSED) return;
         if (phase == Phase.PROBING && offered != null && now - lastProgress >= 750 &&
-                !required.contains(Wire6.NATIVE_CHROME)) finishDiscovery(offered, now);
+                !required.contains(Wire6.NATIVE_CHROME) && !required.contains(Wire6.REMOTE_UI)) finishDiscovery(offered, now);
         if (phase == Phase.CLOSED) return;
         if (now - lastProgress >= 1500) {
             fail(phase == Phase.PROBING ? "No wire-6 OFFER from FM1." :
@@ -257,6 +290,7 @@ public final class OpenSession {
         }
         drainInputs();
         if (phase == Phase.CLOSED) return;
+        if (accepted.contains(Wire6.REMOTE_UI)) { remoteTick(now); return; }
         if (now - lastSend < 34 && !ackCredit) return;
         ackCredit = false;
         if (phase == Phase.PROBING && offered != null && now - lastSend >= 250) {
@@ -343,6 +377,7 @@ public final class OpenSession {
         inputs.clear(); pendingStates.clear(); accepted.clear();transfer=null;transferOffset=0;
         lastNativeView=confirmedNativeView=null; heartbeatSerial=-1;
         fastParts = false; sendingPartEnd = deferredReadyOffset = -1;
+        remote.recover(); remotePending = null;
         diagnosticSerial=-1; diagnosticOp=queuedDiagnosticOp=0; diagnosticStarted=false;
         if (owned) {
             owned = false;
@@ -380,6 +415,30 @@ public final class OpenSession {
     }
     private boolean nativeIdle() {
         return accepted.contains(Wire6.NATIVE_UI) && accepted.contains(Wire6.NATIVE_IDLE_KEEPALIVE);
+    }
+    private void remoteTick(long now) {
+        if (phase != Phase.SYNCHRONIZING && phase != Phase.ACTIVE) return;
+        if (remotePending != null) {
+            if (now - remoteSent >= 250) {
+                remoteSent = now; transmit(Wire6.REMOTE, remoteSerial, remotePending, now);
+            }
+            return;
+        }
+        if (!remote.pending() && now - remoteSample >= 34) {
+            remoteSample = now;
+            try { remote.sample(host.remoteFrame(), host.remoteLeds(), accepted.contains(Wire6.REMOTE_COMPACT)); }
+            catch (Exception error) { fail("Invalid remote framebuffer."); return; }
+        }
+        remotePending = remote.next();
+        if (remotePending != null) {
+            remoteSerial = (remoteSerial + 1) & 16383;
+            remoteSent = now;
+            transmit(Wire6.REMOTE, remoteSerial, remotePending, now);
+        } else if (phase == Phase.ACTIVE && now - lastHeartbeat >= 408) {
+            heartbeatSerial = nextHeartbeatSerial = (nextHeartbeatSerial + 1) & 16383;
+            lastHeartbeat = now;
+            transmit(Wire6.HEARTBEAT, heartbeatSerial, new byte[0], now);
+        }
     }
     /** One outstanding diagnostic request. A timed-out capture is retired by closing the session. */
     public boolean requestDiagnostics(int op, long now) {
@@ -449,7 +508,9 @@ public final class OpenSession {
                     ack[i + 2] != asked.minor || ack[i + 3] != 0) return false;
             selected.add(id);
         }
-        if (!selected.containsAll(required) || selected.contains(Wire6.NATIVE_CHROME) && !selected.contains(Wire6.NATIVE_PANEL) ||
+        if (!selected.containsAll(required) || selected.contains(Wire6.REMOTE_UI) && selected.contains(Wire6.NATIVE_UI) ||
+                selected.contains(Wire6.REMOTE_COMPACT) && !selected.contains(Wire6.REMOTE_UI) ||
+                selected.contains(Wire6.NATIVE_CHROME) && !selected.contains(Wire6.NATIVE_PANEL) ||
                 selected.contains(Wire6.NATIVE_PANEL) && !selected.contains(Wire6.NATIVE_UI) || (selected.contains(Wire6.NATIVE_DELTA) &&
                 !(selected.contains(Wire6.NATIVE_UI) && selected.contains(Wire6.NATIVE_IDLE_KEEPALIVE)))) return false;
         accepted.addAll(selected);

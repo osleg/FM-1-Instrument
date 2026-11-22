@@ -21,7 +21,7 @@ interface InstrumentOutput {
 }
 
 /** Starts with silent PCM and admits native Skiff audio only after Android reports the selected route. */
-class AudioOutput(private val runtime: SkiffRuntime, private val device: AudioDeviceInfo,
+class AudioOutput(private val runtime: PcmRuntime, private val device: AudioDeviceInfo,
                   private val onReady: () -> Unit, private val onFailure: (String) -> Unit,
                   private val onMidiOut: ((LongArray, Long) -> Unit)?) : InstrumentOutput {
     private val main = Handler(Looper.getMainLooper())

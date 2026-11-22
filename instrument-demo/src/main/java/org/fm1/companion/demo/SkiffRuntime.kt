@@ -9,7 +9,7 @@ import java.util.concurrent.Executors
 
 /** Serializes native access and writes complete emulated NOR images in revision order. */
 class SkiffRuntime(private val store: NorStore, private val onFailure: (String) -> Unit,
-                   private val native: SkiffPort = NativeSkiffPort) {
+                   private val native: SkiffPort = NativeSkiffPort) : PcmRuntime {
     constructor(file: File, onFailure: (String) -> Unit) : this(AtomicNorStore(file), onFailure)
 
     val lock = Any()
@@ -38,7 +38,7 @@ class SkiffRuntime(private val store: NorStore, private val onFailure: (String) 
         }
     }
 
-    fun render(out: ShortArray): LongArray = synchronized(lock) {
+    override fun render(out: ShortArray): LongArray = synchronized(lock) {
         if (started && !stopping) {
             native.render(out)
             if (diagnostic) {

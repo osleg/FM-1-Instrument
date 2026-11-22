@@ -24,6 +24,11 @@ class OpenMidiConnection(context: Context, private val surface: Surface, private
         fun capabilitiesAccepted(accepted: Set<Int>) {}
         fun acknowledged(context: Int) {}
     }
+    interface RemoteSurface : Surface {
+        fun frame(): ShortArray?
+        fun leds(): ByteArray = ByteArray(29)
+        override fun snapshot(): ByteArray = byteArrayOf()
+    }
     interface Listener {
         /** Return false when the chosen audio route is no longer available. */
         fun beforeTick(now: Long): Boolean = true
@@ -113,6 +118,8 @@ class OpenMidiConnection(context: Context, private val surface: Surface, private
                             port.send(frame, 0, frame.size)
                         }
                         override fun snapshot() = surface.snapshot()
+                        override fun remoteFrame() = (surface as? RemoteSurface)?.frame()
+                        override fun remoteLeds() = (surface as? RemoteSurface)?.leds() ?: ByteArray(29)
                         override fun input(serial: Int, scan: ByteArray) = surface.input(serial, scan)
                         override fun reset() = surface.reset()
                         override fun capabilitiesAccepted(accepted: Set<Int>) {

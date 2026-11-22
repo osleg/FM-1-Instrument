@@ -6,6 +6,7 @@ plugins {
 // prepare-skiff.sh exports the unmodified release and its factory sample tables.
 def stockDir = rootProject.file('../.cache/skiff-2.5.1/source')
 def runtimeDir = rootProject.file('../.cache/skiff-2.5.1/expanded')
+def emulatorDir = rootProject.file('../.cache/fm1-emu-windjammer')
 def windjammerDir = rootProject.file(providers.gradleProperty('windjammerDir').getOrElse('../Windjammer'))
 def protocolDir = new File(windjammerDir, 'firmware/src')
 def stockNotices = tasks.register('stockNotices', Sync) {
@@ -17,6 +18,10 @@ def stockNotices = tasks.register('stockNotices', Sync) {
     from('src/main/cpp/engines') {
         include '**/LICENSE*', '**/NOTICE*', '**/README.md'
         into 'skiff/engines'
+    }
+    from('src/main/cpp/emulator') {
+        include 'LICENSE-fm1-emu.txt'
+        into 'fm1-emulator'
     }
     into layout.buildDirectory.dir('generated/stockNotices')
 }
@@ -38,14 +43,15 @@ android {
         applicationId 'org.fm1.companion.demo'
         minSdk 26
         targetSdk 35
-        versionCode 15
-        versionName '0.7.0'
+        versionCode 16
+        versionName '0.8.0'
         ndk { abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86' }
         externalNativeBuild {
             cmake {
                 arguments "-DSKIFF_SOURCE_DIR=${runtimeDir.canonicalPath}",
                         "-DSKIFF_GENERATED_DIR=${new File(runtimeDir, 'build/gen').canonicalPath}",
                         "-DSKIFF_PROTOCOL_DIR=${protocolDir.canonicalPath}",
+                        "-DFM1_EMULATOR_DIR=${emulatorDir.canonicalPath}",
                         '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON'
             }
         }

@@ -24,6 +24,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.OpenableColumns
 import android.text.InputType
 import android.view.View
 import android.widget.AdapterView
@@ -39,6 +40,10 @@ class InstrumentActivity : Activity() {
     private lateinit var audioManager: AudioManager
     private lateinit var usbManager: UsbManager
     private lateinit var modeChoice: Spinner
+    private lateinit var engineChoice: Spinner
+    private lateinit var firmwareButton: Button
+    private lateinit var firmwareStatus: TextView
+    private lateinit var sampleSection: LinearLayout
     private lateinit var midiChoice: Spinner
     private lateinit var outputChoice: Spinner
     private lateinit var externalInputChoice: Spinner
@@ -57,6 +62,8 @@ class InstrumentActivity : Activity() {
     private var sampleNotice = ""
     private var wavPickerSession: String? = null
     private var wavPickerUri: Uri? = null
+    private var firmwareUri: Uri? = null
+    private var firmwareName = ""
     private var service: InstrumentPlaybackService? = null
     private var bound = false
     private var visible = false
@@ -137,6 +144,9 @@ class InstrumentActivity : Activity() {
         super.onCreate(savedInstanceState)
         wavPickerSession = savedInstanceState?.getString("wav_session")
         wavPickerUri = savedInstanceState?.getString("wav_uri")?.let(Uri::parse)
+        val firmwarePrefs = getSharedPreferences("emulator_firmware", MODE_PRIVATE)
+        firmwareUri = firmwarePrefs.getString("uri", null)?.let(Uri::parse)
+        firmwareName = firmwarePrefs.getString("name", "").orEmpty()
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         usbManager = getSystemService(USB_SERVICE) as UsbManager
         val stack = LinearLayout(this).apply {
@@ -153,6 +163,21 @@ class InstrumentActivity : Activity() {
         stack.addView(TextView(this).apply {
             text = "Choose FM-1 USB MIDI and an audio destination. Direct USB sends the synth to FM-1 MASTER; Android audio shares its output. Playback continues with the screen off. Disconnect to change selections."
         })
+        stack.addView(label("Instrument mode"))
+        engineChoice = Spinner(this).also { stack.addView(it) }
+        engineChoice.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item,
+            listOf("Windjammer + Instruments", "FM-1 firmware emulator"))
+        engineChoice.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (!updatingChoices) refreshFromService()
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        firmwareButton = Button(this).apply {
+            text = "Import .fwsc firmware"
+            setOnClickListener { chooseFirmware() }
+        }.also { stack.addView(it) }
+        firmwareStatus = label("").also { stack.addView(it) }
         stack.addView(label("Audio destination"))
         modeChoice = Spinner(this).also { stack.addView(it) }
         modeChoice.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item,
@@ -209,37 +234,40 @@ class InstrumentActivity : Activity() {
         }
         stack.addView(resultButton)
         status = label("Loading…").also { it.setTextIsSelectable(true); stack.addView(it) }
-        stack.addView(label("User sample slot"))
+        sampleSection = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        stack.addView(sampleSection)
+        sampleSection.addView(label("User sample slot"))
         sampleSlot = Spinner(this).apply {
             adapter = ArrayAdapter(this@InstrumentActivity, android.R.layout.simple_spinner_dropdown_item,
                 listOf("USR1", "USR2", "USR3"))
             setSelection(savedInstanceState?.getInt("sample_slot", 0) ?: 0)
-        }.also { stack.addView(it) }
+        }.also { sampleSection.addView(it) }
         importButton = Button(this).apply {
             text = "Import WAV"
             setOnClickListener { chooseWav() }
-        }.also { stack.addView(it) }
+        }.also { sampleSection.addView(it) }
         captureButton = Button(this).apply {
             setOnClickListener {
                 val owner = service ?: return@setOnClickListener
                 sampleNotice = ""
                 if (owner.sampleState().recording) owner.finishSampleCapture() else owner.startSampleCapture()
             }
-        }.also { stack.addView(it) }
+        }.also { sampleSection.addView(it) }
         saveSampleButton = Button(this).apply {
             text = "Save sample"
             setOnClickListener { confirmSampleSave() }
-        }.also { stack.addView(it) }
+        }.also { sampleSection.addView(it) }
         discardSampleButton = Button(this).apply {
             text = "Discard sample"
             setOnClickListener { service?.discardSample() }
-        }.also { stack.addView(it) }
-        sampleStatus = label("").also { stack.addView(it) }
-        stack.addView(Button(this).apply {
+        }.also { sampleSection.addView(it) }
+        sampleStatus = label("").also { sampleSection.addView(it) }
+        sampleSection.addView(Button(this).apply {
             text = "Edit DX386 lyrics"
             setOnClickListener { editDxText() }
         })
         refreshSampleControls()
+        refreshEngineControls()
         val filter = IntentFilter().apply {
             addAction(ACTION_USB_PERMISSION)
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
@@ -278,6 +306,37 @@ class InstrumentActivity : Activity() {
         }
     }
 
+    private fun emulatorSelected() = engineChoice.selectedItemPosition == 1
+
+    private fun refreshEngineControls() {
+        if (!::status.isInitialized || !::sampleSection.isInitialized) return
+        val emulator = emulatorSelected()
+        val active = service?.snapshot()?.active == true
+        firmwareButton.visibility = if (emulator) View.VISIBLE else View.GONE
+        firmwareStatus.visibility = firmwareButton.visibility
+        firmwareStatus.text = if (firmwareUri == null) "Choose a .fwsc package to emulate." else
+            "Firmware: $firmwareName"
+        firmwareButton.isEnabled = !active
+        sampleSection.visibility = if (emulator) View.GONE else View.VISIBLE
+        measureButton.visibility = if (emulator) View.GONE else View.VISIBLE
+        resultButton.visibility = measureButton.visibility
+        externalInputChoice.isEnabled = !active && !emulator
+        externalOutputChoice.isEnabled = !active && !emulator
+        if (!active && emulator && firmwareUri == null) connectButton.isEnabled = false
+    }
+
+    @Suppress("DEPRECATION")
+    private fun chooseFirmware() {
+        try {
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+            }, PICK_FIRMWARE)
+        } catch (_: android.content.ActivityNotFoundException) {
+            status.text = "No file picker is available."
+        }
+    }
+
     @Suppress("DEPRECATION")
     private fun chooseWav() {
         val session = service?.sampleState()?.session ?: return
@@ -300,6 +359,31 @@ class InstrumentActivity : Activity() {
     @Deprecated("Uses the platform picker result API for this Activity.")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == PICK_FIRMWARE) {
+            val uri = data?.data?.takeIf { resultCode == RESULT_OK } ?: return
+            if (service?.snapshot()?.active == true) return
+            val name = runCatching {
+                contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                    if (it.moveToFirst()) it.getString(0) else null
+                }
+            }.getOrNull().orEmpty()
+            if (!name.endsWith(".fwsc", ignoreCase = true)) {
+                status.text = "Choose a .fwsc firmware package."
+                return
+            }
+            try {
+                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (error: SecurityException) {
+                status.text = "Could not retain access to this firmware package."
+                return
+            }
+            firmwareUri = uri
+            firmwareName = name
+            getSharedPreferences("emulator_firmware", MODE_PRIVATE).edit()
+                .putString("uri", uri.toString()).putString("name", name).apply()
+            refreshFromService()
+            return
+        }
         if (requestCode != PICK_WAV || wavPickerSession == null) return
         wavPickerUri = data?.data?.takeIf { resultCode == RESULT_OK }
         if (wavPickerUri == null) wavPickerSession = null
@@ -423,7 +507,7 @@ class InstrumentActivity : Activity() {
         connectButton.isEnabled = midiDevices.isNotEmpty() &&
             (selected == AudioDestination.FM1_DIRECT || outputs.isNotEmpty())
         measureButton.isEnabled = connectButton.isEnabled && destination() != AudioDestination.PHONE
-        } finally { updatingChoices = false }
+        } finally { updatingChoices = false; refreshEngineControls() }
     }
 
     private fun refreshDirectTarget() {
@@ -460,6 +544,9 @@ class InstrumentActivity : Activity() {
         status.text = state.status + owner.screenStatus().let { if (it.isEmpty()) "" else "\nSkiff: $it" } +
             permissionNotice.let { if (it.isEmpty()) "" else "\n$it" }
         if (state.active) {
+            updatingChoices = true
+            try { engineChoice.setSelection(if (state.emulator) 1 else 0) }
+            finally { updatingChoices = false }
             val modes = AudioDestination.values()
             updatingChoices = true
             try { modes.indexOf(state.destination).takeIf { it >= 0 }?.let { modeChoice.setSelection(it) } }
@@ -467,6 +554,7 @@ class InstrumentActivity : Activity() {
             outputLabel.text = "${state.destination?.title} output: ${state.audioName}"
         }
         modeChoice.isEnabled = !state.active
+        engineChoice.isEnabled = !state.active
         midiChoice.isEnabled = !state.active
         outputChoice.isEnabled = !state.active && destination() != AudioDestination.FM1_DIRECT
         externalInputChoice.isEnabled = !state.active
@@ -477,12 +565,14 @@ class InstrumentActivity : Activity() {
         connectButton.isEnabled = state.active || (midiDevices.isNotEmpty() &&
             (destination() == AudioDestination.FM1_DIRECT || outputs.isNotEmpty()))
         refreshSampleControls()
+        refreshEngineControls()
     }
 
     private fun toggle(diagnostic: Boolean = false) {
         permissionNotice = ""
         val owner = service ?: return
         if (owner.snapshot().active) { owner.disconnect(); refreshDevices(); return }
+        if (emulatorSelected() && firmwareUri == null) { status.text = "Import a .fwsc firmware package first."; return }
         val selectedMidi = midiDevices.getOrNull(midiChoice.selectedItemPosition)
         val selected = destination()
         if (selectedMidi == null) { status.text = "Choose FM-1 USB MIDI"; return }
@@ -568,10 +658,14 @@ class InstrumentActivity : Activity() {
             .putExtra(InstrumentPlaybackService.EXTRA_MIDI_ID, midiId)
             .putExtra(InstrumentPlaybackService.EXTRA_AUDIO_ID, audioId)
             .putExtra(InstrumentPlaybackService.EXTRA_DESTINATION, selected.ordinal)
+            .putExtra(InstrumentPlaybackService.EXTRA_EMULATOR_URI,
+                if (emulatorSelected()) firmwareUri?.toString() else null)
+            .putExtra(InstrumentPlaybackService.EXTRA_FIRMWARE_NAME,
+                if (emulatorSelected()) firmwareName else null)
             .putExtra(InstrumentPlaybackService.EXTRA_EXTERNAL_INPUT_ID,
-                if (diagnostic) -1 else externalInputs.getOrNull(externalInputChoice.selectedItemPosition - 1)?.id ?: -1)
+                if (diagnostic || emulatorSelected()) -1 else externalInputs.getOrNull(externalInputChoice.selectedItemPosition - 1)?.id ?: -1)
             .putExtra(InstrumentPlaybackService.EXTRA_EXTERNAL_OUTPUT_ID,
-                if (diagnostic) -1 else externalOutputs.getOrNull(externalOutputChoice.selectedItemPosition - 1)?.id ?: -1)
+                if (diagnostic || emulatorSelected()) -1 else externalOutputs.getOrNull(externalOutputChoice.selectedItemPosition - 1)?.id ?: -1)
         try { startForegroundService(intent) } catch (error: RuntimeException) {
             status.text = "Could not start playback: ${error.message ?: error.javaClass.simpleName}"
             connectButton.isEnabled = true
@@ -610,5 +704,6 @@ class InstrumentActivity : Activity() {
         private const val ACTION_USB_PERMISSION = "org.fm1.companion.demo.USB_PERMISSION"
         private const val EXTRA_PERMISSION_SERIAL = "permission_serial"
         private const val PICK_WAV = 2
+        private const val PICK_FIRMWARE = 3
     }
 }

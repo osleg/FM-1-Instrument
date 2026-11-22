@@ -48,3 +48,23 @@ target_include_directories(skiff-companion PRIVATE
     "${plaits}/thirdparty/eurorack"
     "${SKIFF_PROTOCOL_DIR}")
 target_link_libraries(skiff-companion PRIVATE dx386_runtime m)
+
+# The binary emulator is available only for the two ABIs built by fm1-web.
+# Other ABIs retain the existing instrument library without a stub emulator.
+if(ANDROID_ABI STREQUAL "arm64-v8a" OR ANDROID_ABI STREQUAL "x86_64")
+    if(ANDROID_ABI STREQUAL "arm64-v8a")
+        set(emulator_target "aarch64-linux-android")
+    else()
+        set(emulator_target "x86_64-linux-android")
+    endif()
+    set(emulator_archive "${FM1_EMULATOR_DIR}/target/${emulator_target}/release/libfm1_web.a")
+    if(NOT EXISTS "${emulator_archive}")
+        message(FATAL_ERROR "FM-1 emulator archive missing: ${emulator_archive}. Run instrument-demo/tools/build-emulator.ps1 first.")
+    endif()
+    add_library(fm1-web STATIC IMPORTED)
+    set_target_properties(fm1-web PROPERTIES IMPORTED_LOCATION "${emulator_archive}")
+    add_library(fm1-emulator SHARED emulator/fm1_emulator_jni.c)
+    target_include_directories(fm1-emulator PRIVATE emulator)
+    target_compile_features(fm1-emulator PRIVATE c_std_99)
+    target_link_libraries(fm1-emulator PRIVATE fm1-web log android dl m)
+endif()

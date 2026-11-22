@@ -11,10 +11,11 @@ import android.media.midi.MidiDeviceInfo
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
+import java.util.concurrent.ArrayBlockingQueue
 
-/** Sends Skiff PCM through FM-1's isolated vendor interface. The worker alone owns its USB connection. */
+/** Sends synth PCM through FM-1's isolated vendor interface. The USB worker owns its connection. */
 class DirectUsbOutput(private val manager: UsbManager, private val device: UsbDevice,
-                      private val runtime: SkiffRuntime, private val onReady: () -> Unit,
+                      private val runtime: PcmRuntime, private val onReady: () -> Unit,
                       private val onFailure: (String) -> Unit,
                       private val onMidiOut: ((LongArray, Long) -> Unit)?) : InstrumentOutput {
     private val main = Handler(Looper.getMainLooper())
@@ -46,7 +47,8 @@ class DirectUsbOutput(private val manager: UsbManager, private val device: UsbDe
 
     override fun queueDescription(): String {
         check(routeMatches()) { "FM-1 direct USB output changed" }
-        return "direct USB, 128-frame writes, 384-frame maximum device queue (estimated)"
+        val reserve = if (runtime is EmulatorRuntime) ", up to 1024 frames of phone buffering" else ""
+        return "direct USB, 128-frame writes, 384-frame maximum device queue (estimated)$reserve"
     }
 
     override fun stop() {
@@ -66,6 +68,7 @@ class DirectUsbOutput(private val manager: UsbManager, private val device: UsbDe
         var connection: UsbDeviceConnection? = null
         var alt0: UsbInterface? = null
         var claimed = false
+        var emulatorAudio: EmulatorAudioQueue? = null
         try {
             try { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) }
             catch (_: SecurityException) { /* Best effort on app threads. */ }
@@ -99,6 +102,13 @@ class DirectUsbOutput(private val manager: UsbManager, private val device: UsbDe
                     }
                     if (!running) return
                 }
+                if (runtime is EmulatorRuntime) {
+                    // The device queue only covers a few milliseconds. Keep its writer
+                    // moving while the emulator computes its next burst of audio.
+                    val queue = emulatorAudio ?: EmulatorAudioQueue(runtime).also { emulatorAudio = it }
+                    queue.writeNext(opened, endpoint)
+                    continue
+                }
                 val packets = runtime.render(pcm)
                 if (!running) break
                 val sendMidi = onMidiOut
@@ -106,11 +116,7 @@ class DirectUsbOutput(private val manager: UsbManager, private val device: UsbDe
                     // The firmware queue is capped at 384 frames. This is an estimate, not a DAC timestamp.
                     sendMidi(packets, System.nanoTime() + MAX_QUEUE_FRAMES * 1_000_000_000L / SAMPLE_RATE)
                 }
-                for (i in pcm.indices) {
-                    val sample = pcm[i].toInt()
-                    bytes[i * 2] = sample.toByte()
-                    bytes[i * 2 + 1] = (sample ushr 8).toByte()
-                }
+                encodePcm(pcm, bytes)
                 writeBlock(opened, endpoint, bytes)
             }
         } catch (error: Throwable) {
@@ -125,6 +131,7 @@ class DirectUsbOutput(private val manager: UsbManager, private val device: UsbDe
                 if (!explicitlyStopped) onFailure(error.message ?: "FM-1 direct USB output failed")
             }
         } finally {
+            emulatorAudio?.close()
             // Keep all interface changes and connection disposal on the same worker.
             if (connection != null) {
                 if (claimed && alt0 != null) {
@@ -139,6 +146,80 @@ class DirectUsbOutput(private val manager: UsbManager, private val device: UsbDe
                 audible = false
                 stateLock.notifyAll()
             }
+        }
+    }
+
+    private inner class EmulatorAudioQueue(runtime: EmulatorRuntime) {
+        private val free = ArrayBlockingQueue<ByteArray>(EMU_BUFFER_BLOCKS)
+        private val ready = ArrayBlockingQueue<ByteArray>(EMU_BUFFER_BLOCKS)
+        private var primed = false
+        @Volatile private var failure: Throwable? = null
+        private val producer: Thread
+
+        init {
+            repeat(EMU_BUFFER_BLOCKS) { free.add(ByteArray(BLOCK_BYTES)) }
+            producer = Thread({
+                try {
+                    try { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) }
+                    catch (_: SecurityException) { /* Best effort on app threads. */ }
+                    val pcm = ShortArray(BLOCK_FRAMES * 2)
+                    while (running && !Thread.currentThread().isInterrupted) {
+                        val block = free.take()
+                        if (!running || Thread.currentThread().isInterrupted) break
+                        runtime.render(pcm)
+                        encodePcm(pcm, block)
+                        ready.put(block)
+                    }
+                } catch (error: Throwable) {
+                    if (running) {
+                        failure = error
+                        worker.interrupt()
+                    }
+                }
+            }, "FM1-emulator-PCM").also { it.start() }
+        }
+
+        fun writeNext(connection: UsbDeviceConnection, endpoint: UsbEndpoint) {
+            try {
+                failure?.let { throw it }
+                if (!primed) {
+                    // Prime the queue using complete rendered blocks. Keep at most
+                    // eight blocks in all states, including the blocks being written.
+                    val initial = ArrayList<ByteArray>(EMU_PRIME_BLOCKS)
+                    repeat(EMU_PRIME_BLOCKS) { initial.add(ready.take()) }
+                    for (block in initial) send(connection, endpoint, block)
+                    primed = true
+                } else {
+                    send(connection, endpoint, ready.take())
+                }
+            } catch (error: InterruptedException) {
+                throw failure ?: error
+            }
+        }
+
+        private fun send(connection: UsbDeviceConnection, endpoint: UsbEndpoint, block: ByteArray) {
+            writeBlock(connection, endpoint, block)
+            check(free.offer(block)) { "Emulator USB queue exceeded its capacity" }
+        }
+
+        fun close() {
+            producer.interrupt()
+            val interrupted = Thread.interrupted()
+            try {
+                producer.join(100)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } finally {
+                if (interrupted) Thread.currentThread().interrupt()
+            }
+        }
+    }
+
+    private fun encodePcm(pcm: ShortArray, bytes: ByteArray) {
+        for (i in pcm.indices) {
+            val sample = pcm[i].toInt()
+            bytes[i * 2] = sample.toByte()
+            bytes[i * 2 + 1] = (sample ushr 8).toByte()
         }
     }
 
@@ -164,6 +245,8 @@ class DirectUsbOutput(private val manager: UsbManager, private val device: UsbDe
         private const val PROTOCOL = 1
         private const val BLOCK_FRAMES = 128
         private const val BLOCK_BYTES = BLOCK_FRAMES * 4
+        private const val EMU_BUFFER_BLOCKS = 8
+        private const val EMU_PRIME_BLOCKS = 6
         private const val MAX_QUEUE_FRAMES = 384L
         private const val SAMPLE_RATE = 44100L
         private const val WRITE_TIMEOUT_MS = 50

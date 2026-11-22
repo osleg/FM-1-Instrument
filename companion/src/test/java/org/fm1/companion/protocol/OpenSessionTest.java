@@ -34,6 +34,8 @@ public class OpenSessionTest {
         boolean fastNative;
         long clock;
         byte[] onInputView;
+        short[] remoteFrame;
+        @Override public short[] remoteFrame() { return remoteFrame; }
         @Override public void send(byte[] b) { sent.add(b); }
         @Override public byte[] snapshot() { events.add("snapshot"); return view != null ? view : Wire6.viewPrefix(2, 0, context, "Instrument", "Ready"); }
         @Override public boolean input(int serial, byte[] scan) {
@@ -74,6 +76,65 @@ public class OpenSessionTest {
         s.tick(34);
         inbound(s, Wire6.ACK, 0, ACCEPT, 40);
         s.tick(68);
+    }
+    @Test public void remoteScreenWaitsForCommitRetriesAndRecoversThenSendsOnlyChanges() {
+        App app = new App(); app.remoteFrame = new short[240 * 240];
+        for (int i = 0; i < app.remoteFrame.length; i++) app.remoteFrame[i] = (short)(i * 17);
+        OpenSession s = new OpenSession(app, "test.remote", Wire6.PHONE,
+                new Wire6.Capability(Wire6.INSTRUMENT, 1, 0, true),
+                new Wire6.Capability(Wire6.REMOTE_UI, 1, 0, true));
+        s.begin(SESSION, 0);
+        inbound(s, Wire6.OFFER, 0, new byte[]{1,2,1,28,1,1,1,1,0,0}, 10);
+        inbound(s, Wire6.OFFER, 1, new byte[]{1,2,1,28,1,1,16,1,0,0}, 20);
+        s.tick(54);
+        inbound(s, Wire6.ACK, 0, new byte[]{1,0,2,1,1,0,0,16,1,0,0}, 60);
+        s.tick(94);
+        byte[] reset = app.sent.get(app.sent.size() - 1);
+        assertEquals(Wire6.REMOTE, reset[5]); assertEquals(0, reset[10]);
+        s.tick(344); assertArrayEquals(reset, app.sent.get(app.sent.size() - 1));
+        // Reject one command: recovery must restart from a RESET, never trust speculative cache state.
+        inbound(s, Wire6.ACK, Wire6.u14(reset, 8), new byte[]{13,2}, 345);
+        byte[] retry = app.sent.get(app.sent.size() - 1);
+        assertEquals(0, retry[10]); assertNotEquals(Wire6.u14(reset,8), Wire6.u14(retry,8));
+        short[][] tiles = new short[128][256];
+        short[] displayed = new short[240 * 240];
+        long now = 346;
+        int blits = 0;
+        while (!s.isSynchronized() && now < 4000) {
+            byte[] message = app.sent.get(app.sent.size() - 1);
+            assertEquals(Wire6.REMOTE, message[5]);
+            int op = message[10];
+            if (op == 1) {
+                int slot = message[11], offset = Wire6.u14(message,12);
+                for (int at = 14; at < message.length - 1; at += 3)
+                    tiles[slot][offset++] = (short)(message[at] | message[at+1] << 7 | message[at+2] << 14);
+            } else if (op == 2) {
+                blits++;
+                for (int row = 0; row < 16; row++)
+                    System.arraycopy(tiles[message[11]], row*16, displayed,
+                            (message[13]*16+row)*240+message[12]*16,16);
+            } else if (op == 3) {
+                assertEquals(225, blits);
+                assertArrayEquals(app.remoteFrame, displayed);
+                assertEquals(0, app.ready);
+            }
+            inbound(s, Wire6.ACK, Wire6.u14(message,8), new byte[]{13,0}, now++);
+        }
+        assertTrue(s.isSynchronized()); assertEquals(1, app.ready);
+        int sent = app.sent.size();
+        s.tick(now + 40);
+        for (int i = sent; i < app.sent.size(); i++) assertEquals(Wire6.HEARTBEAT, app.sent.get(i)[5]);
+        app.remoteFrame[0] ^= 1;
+        s.tick(now + 80);
+        int changedBlits = 0;
+        for (int i = 0; i < 9; i++) {
+            byte[] message = app.sent.get(app.sent.size()-1);
+            assertEquals(Wire6.REMOTE, message[5]);
+            if (message[10] == 2) changedBlits++;
+            inbound(s, Wire6.ACK, Wire6.u14(message,8), new byte[]{13,0}, now+81+i);
+            if (message[10] == 3) break;
+        }
+        assertEquals(1, changedBlits);
     }
     @Test public void negotiationRequiresExplicitAcceptedCapabilitiesAndSentStateAck() {
         App app = new App(); OpenSession s = session(app);
